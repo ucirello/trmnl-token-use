@@ -2,12 +2,15 @@ package main
 
 import (
 	"bytes"
+	"compress/zlib"
 	"context"
 	"database/sql"
+	"encoding/binary"
 	"encoding/csv"
 	"encoding/json"
 	"flag"
 	"fmt"
+	"hash/crc32"
 	"image"
 	"image/color"
 	"image/png"
@@ -220,13 +223,23 @@ func pushReport(ctx context.Context, cfg cliConfig, client *http.Client, stdout 
 	if err := uploadTRMNLWebhookImage(ctx, client, webhookURL, pngBytes); err != nil {
 		return err
 	}
-	_, err = fmt.Fprintf(stdout, "TRMNL upload accepted: 800x480 1-bit PNG, %d bytes\n", len(pngBytes))
+	_, err = fmt.Fprintf(stdout, "TRMNL upload accepted: 800x480 2-level grayscale PNG, %d bytes\n", len(pngBytes))
 	return err
 }
 
 func validateTRMNLPNG(pngBytes []byte) error {
 	if len(pngBytes) > trmnlPNGMax {
 		return fmt.Errorf("generated image is too large for TRMNL Webhook Image: %d bytes, max %d", len(pngBytes), trmnlPNGMax)
+	}
+	info, err := pngHeaderInfo(pngBytes)
+	if err != nil {
+		return err
+	}
+	if info.width != trmnlPNGWidth || info.height != trmnlPNGHeight {
+		return fmt.Errorf("generated image is not TRMNL-ready: got %dx%d, want %dx%d", info.width, info.height, trmnlPNGWidth, trmnlPNGHeight)
+	}
+	if info.bitDepth != 1 || info.colorType != 0 {
+		return fmt.Errorf("generated image is not TRMNL-ready: expected 1-bit 2-level grayscale PNG")
 	}
 	img, err := png.Decode(bytes.NewReader(pngBytes))
 	if err != nil {
@@ -236,21 +249,36 @@ func validateTRMNLPNG(pngBytes []byte) error {
 	if bounds.Dx() != trmnlPNGWidth || bounds.Dy() != trmnlPNGHeight {
 		return fmt.Errorf("generated image is not TRMNL-ready: got %dx%d, want %dx%d", bounds.Dx(), bounds.Dy(), trmnlPNGWidth, trmnlPNGHeight)
 	}
-	paletteImg, ok := img.(*image.Paletted)
-	if !ok || len(paletteImg.Palette) != 2 {
-		return fmt.Errorf("generated image is not TRMNL-ready: expected 1-bit 2-level grayscale PNG")
-	}
-	seen := make(map[uint8]struct{})
-	for _, pixel := range paletteImg.Pix {
-		seen[pixel] = struct{}{}
-		if pixel > 1 {
-			return fmt.Errorf("generated image is not TRMNL-ready: expected 1-bit 2-level grayscale PNG")
+	for y := bounds.Min.Y; y < bounds.Max.Y; y++ {
+		for x := bounds.Min.X; x < bounds.Max.X; x++ {
+			if color.GrayModel.Convert(img.At(x, y)).(color.Gray).Y != 0x00 && color.GrayModel.Convert(img.At(x, y)).(color.Gray).Y != 0xff {
+				return fmt.Errorf("generated image is not TRMNL-ready: expected 1-bit 2-level grayscale PNG")
+			}
 		}
 	}
-	if len(seen) > 2 {
-		return fmt.Errorf("generated image is not TRMNL-ready: expected 1-bit 2-level grayscale PNG")
-	}
 	return nil
+}
+
+type pngInfo struct {
+	width     int
+	height    int
+	bitDepth  byte
+	colorType byte
+}
+
+func pngHeaderInfo(pngBytes []byte) (pngInfo, error) {
+	if len(pngBytes) < 33 || !bytes.Equal(pngBytes[:8], []byte{137, 80, 78, 71, 13, 10, 26, 10}) {
+		return pngInfo{}, fmt.Errorf("generated image is not a valid PNG")
+	}
+	if string(pngBytes[12:16]) != "IHDR" {
+		return pngInfo{}, fmt.Errorf("generated image is not a valid PNG: missing IHDR")
+	}
+	return pngInfo{
+		width:     int(binary.BigEndian.Uint32(pngBytes[16:20])),
+		height:    int(binary.BigEndian.Uint32(pngBytes[20:24])),
+		bitDepth:  pngBytes[24],
+		colorType: pngBytes[25],
+	}, nil
 }
 
 func uploadTRMNLWebhookImage(ctx context.Context, client *http.Client, webhookURL string, pngBytes []byte) error {
@@ -1286,19 +1314,76 @@ func writeGrayscalePNG(w io.Writer, pngBytes []byte) error {
 }
 
 func encode1BitPNG(w io.Writer, gray *image.Gray) error {
-	palette := color.Palette{color.Gray{Y: 0x00}, color.Gray{Y: 0xff}}
-	mono := image.NewPaletted(gray.Bounds(), palette)
-	for y := gray.Bounds().Min.Y; y < gray.Bounds().Max.Y; y++ {
-		for x := gray.Bounds().Min.X; x < gray.Bounds().Max.X; x++ {
+	bounds := gray.Bounds()
+	width := bounds.Dx()
+	height := bounds.Dy()
+	rowBytes := (width + 7) / 8
+	raw := make([]byte, 0, height*(rowBytes+1))
+	for y := bounds.Min.Y; y < bounds.Max.Y; y++ {
+		raw = append(raw, 0) // filter type 0
+		row := make([]byte, rowBytes)
+		for x := bounds.Min.X; x < bounds.Max.X; x++ {
 			if gray.GrayAt(x, y).Y >= 0xc0 {
-				mono.SetColorIndex(x, y, 1)
+				bit := uint(7 - ((x - bounds.Min.X) % 8))
+				row[(x-bounds.Min.X)/8] |= 1 << bit
 			}
 		}
+		raw = append(raw, row...)
 	}
-	if err := png.Encode(w, mono); err != nil {
-		return fmt.Errorf("write 1-bit grayscale png: %w", err)
+	var compressed bytes.Buffer
+	zw, err := zlib.NewWriterLevel(&compressed, zlib.BestCompression)
+	if err != nil {
+		return fmt.Errorf("create png compressor: %w", err)
+	}
+	if _, err := zw.Write(raw); err != nil {
+		zw.Close()
+		return fmt.Errorf("compress png data: %w", err)
+	}
+	if err := zw.Close(); err != nil {
+		return fmt.Errorf("finish png compression: %w", err)
+	}
+	if _, err := w.Write([]byte{137, 80, 78, 71, 13, 10, 26, 10}); err != nil {
+		return fmt.Errorf("write png signature: %w", err)
+	}
+	ihdr := make([]byte, 13)
+	binary.BigEndian.PutUint32(ihdr[0:4], uint32(width))
+	binary.BigEndian.PutUint32(ihdr[4:8], uint32(height))
+	ihdr[8] = 1 // bit depth
+	ihdr[9] = 0 // grayscale
+	ihdr[10] = 0
+	ihdr[11] = 0
+	ihdr[12] = 0
+	if err := writePNGChunk(w, "IHDR", ihdr); err != nil {
+		return err
+	}
+	if err := writePNGChunk(w, "IDAT", compressed.Bytes()); err != nil {
+		return err
+	}
+	if err := writePNGChunk(w, "IEND", nil); err != nil {
+		return fmt.Errorf("write 2-level grayscale png: %w", err)
 	}
 	return nil
+}
+
+func writePNGChunk(w io.Writer, chunkType string, data []byte) error {
+	var length [4]byte
+	binary.BigEndian.PutUint32(length[:], uint32(len(data)))
+	if _, err := w.Write(length[:]); err != nil {
+		return err
+	}
+	if _, err := io.WriteString(w, chunkType); err != nil {
+		return err
+	}
+	if _, err := w.Write(data); err != nil {
+		return err
+	}
+	crc := crc32.NewIEEE()
+	_, _ = io.WriteString(crc, chunkType)
+	_, _ = crc.Write(data)
+	var sum [4]byte
+	binary.BigEndian.PutUint32(sum[:], crc.Sum32())
+	_, err := w.Write(sum[:])
+	return err
 }
 
 func decodeGrayscalePNG(pngBytes []byte) (*image.Gray, error) {

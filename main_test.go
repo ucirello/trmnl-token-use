@@ -186,7 +186,8 @@ func TestWritePNG(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	img, err := png.Decode(&out)
+	pngBytes := out.Bytes()
+	img, err := png.Decode(bytes.NewReader(pngBytes))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -196,13 +197,18 @@ func TestWritePNG(t *testing.T) {
 	if got := img.Bounds().Dy(); got != 480 {
 		t.Fatalf("height mismatch: got %d, want 480", got)
 	}
-	if _, ok := img.(*image.Paletted); !ok {
-		t.Fatalf("PNG is %T, want *image.Paletted for 1-bit output", img)
+	info, err := pngHeaderInfo(pngBytes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.bitDepth != 1 || info.colorType != 0 {
+		t.Fatalf("PNG header bitDepth/colorType = %d/%d, want 1/0", info.bitDepth, info.colorType)
 	}
 }
 
-func TestValidateTRMNLPNGRejects8BitGray(t *testing.T) {
+func TestValidateTRMNLPNGRejectsContinuousGray(t *testing.T) {
 	img := image.NewGray(image.Rect(0, 0, trmnlPNGWidth, trmnlPNGHeight))
+	img.SetGray(0, 0, color.Gray{Y: 0x80})
 	var out bytes.Buffer
 	if err := png.Encode(&out, img); err != nil {
 		t.Fatal(err)
@@ -317,9 +323,12 @@ func assertRat(t *testing.T, name string, got *big.Rat, want *big.Rat) {
 
 func validTRMNLPNG(t *testing.T) []byte {
 	t.Helper()
-	img := image.NewPaletted(image.Rect(0, 0, trmnlPNGWidth, trmnlPNGHeight), color.Palette{color.Gray{Y: 0xff}, color.Gray{Y: 0x00}})
+	img := image.NewGray(image.Rect(0, 0, trmnlPNGWidth, trmnlPNGHeight))
+	for i := range img.Pix {
+		img.Pix[i] = 0xff
+	}
 	var out bytes.Buffer
-	if err := png.Encode(&out, img); err != nil {
+	if err := encode1BitPNG(&out, img); err != nil {
 		t.Fatal(err)
 	}
 	return out.Bytes()
