@@ -20,7 +20,6 @@ import (
 	"net/http"
 	"net/url"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"regexp"
 	"sort"
@@ -28,8 +27,6 @@ import (
 	"time"
 
 	"github.com/chromedp/chromedp"
-	"github.com/go-echarts/go-echarts/v2/charts"
-	"github.com/go-echarts/go-echarts/v2/opts"
 
 	_ "modernc.org/sqlite"
 )
@@ -133,7 +130,7 @@ type cliConfig struct {
 func parseSharedFlags(name string, args []string) (cliConfig, error) {
 	flags := flag.NewFlagSet(name, flag.ContinueOnError)
 	flags.SetOutput(io.Discard)
-	dbPath := flags.String("db", "", "path to opencode sqlite database")
+	dbPath := flags.String("db", "", "read a SQLite database instead of the OpenCode V2 API")
 	modelsURL := flags.String("models", modelsDevURL, "models.dev api json url")
 	if err := flags.Parse(args); err != nil {
 		return cliConfig{}, err
@@ -144,7 +141,7 @@ func parseSharedFlags(name string, args []string) (cliConfig, error) {
 func parseRenderFlags(args []string) (cliConfig, error) {
 	flags := flag.NewFlagSet("render", flag.ContinueOnError)
 	flags.SetOutput(io.Discard)
-	dbPath := flags.String("db", "", "path to opencode sqlite database")
+	dbPath := flags.String("db", "", "read a SQLite database instead of the OpenCode V2 API")
 	modelsURL := flags.String("models", modelsDevURL, "models.dev api json url")
 	format := flags.String("format", "png", "output format: csv or png")
 	outPath := flags.String("out", "token-usage.png", "output path for png; csv always writes to stdout")
@@ -155,21 +152,8 @@ func parseRenderFlags(args []string) (cliConfig, error) {
 }
 
 func renderReportRows(ctx context.Context, cfg cliConfig) ([]row, error) {
-	dbPath := cfg.dbPath
-	if dbPath == "" {
-		path, err := defaultDBPath(ctx)
-		if err != nil {
-			return nil, err
-		}
-		dbPath = path
-	}
-	db, err := sql.Open("sqlite", dbPath)
-	if err != nil {
-		return nil, fmt.Errorf("open opencode database: %w", err)
-	}
-	defer db.Close()
 	window := newReportWindow(time.Now())
-	usage, err := loadUsage(ctx, db, window.start)
+	usage, err := loadReportUsage(ctx, cfg.dbPath, window)
 	if err != nil {
 		return nil, err
 	}
@@ -370,8 +354,8 @@ Commands:
 
 Flags:
   -db string
-        path to opencode sqlite database
-        default: discovered with "opencode debug paths"
+        read an explicit SQLite database instead of the OpenCode V2 API
+        default: fetch daily usage with "opencode2 api" (requires opencode2 on PATH)
 
   -models string
         models.dev API JSON URL
@@ -405,37 +389,25 @@ func newReportWindow(now time.Time) reportWindow {
 	}
 }
 
-func defaultDBPath(ctx context.Context) (string, error) {
-	cmd := exec.CommandContext(ctx, "opencode", "debug", "paths")
-	output, err := cmd.Output()
-	if err != nil {
-		return "", fmt.Errorf("run opencode debug paths: %w", err)
-	}
-	dataDir, err := parseOpenCodeDataDir(string(output))
-	if err != nil {
-		return "", err
-	}
-	return filepath.Join(dataDir, "opencode.db"), nil
-}
-
-func parseOpenCodeDataDir(output string) (string, error) {
-	for _, line := range strings.Split(output, "\n") {
-		fields := strings.Fields(line)
-		if len(fields) >= 2 && fields[0] == "data" {
-			return strings.Join(fields[1:], " "), nil
-		}
-	}
-	return "", fmt.Errorf("parse opencode debug paths: missing data path")
-}
-
 func loadUsage(ctx context.Context, db *sql.DB, start time.Time) (map[dailyUsageKey]usageTotals, error) {
 	result := make(map[dailyUsageKey]usageTotals)
-	if err := loadLegacyMessageUsage(ctx, db, start, result); err != nil {
+	legacy, err := tableExists(ctx, db, "message")
+	if err != nil {
 		return nil, err
 	}
-	if exists, err := tableExists(ctx, db, "session_message"); err != nil {
+	current, err := tableExists(ctx, db, "session_message")
+	if err != nil {
 		return nil, err
-	} else if exists {
+	}
+	if !legacy && !current {
+		return nil, fmt.Errorf("opencode database has no supported message table (message or session_message)")
+	}
+	if legacy {
+		if err := loadLegacyMessageUsage(ctx, db, start, result, current); err != nil {
+			return nil, err
+		}
+	}
+	if current {
 		if err := loadSessionMessageUsage(ctx, db, start, result); err != nil {
 			return nil, err
 		}
@@ -443,8 +415,13 @@ func loadUsage(ctx context.Context, db *sql.DB, start time.Time) (map[dailyUsage
 	return result, nil
 }
 
-func loadLegacyMessageUsage(ctx context.Context, db *sql.DB, start time.Time, result map[dailyUsageKey]usageTotals) error {
-	const query = `
+func loadLegacyMessageUsage(ctx context.Context, db *sql.DB, start time.Time, result map[dailyUsageKey]usageTotals, hasSessionMessages bool) error {
+	excludeMigrated := ""
+	if hasSessionMessages {
+		// Prefer the newer record when both tables contain the same message ID.
+		excludeMigrated = ` AND NOT EXISTS (SELECT 1 FROM session_message WHERE session_message.id = message.id)`
+	}
+	query := `
 		SELECT
 			strftime('%Y-%m-%d', time_created / 1000, 'unixepoch', 'localtime'),
 			json_extract(data, '$.providerID'),
@@ -458,7 +435,7 @@ func loadLegacyMessageUsage(ctx context.Context, db *sql.DB, start time.Time, re
 			message
 		WHERE
 			json_extract(data, '$.role') = 'assistant'
-			AND time_created >= ?
+			AND time_created >= ?` + excludeMigrated + `
 		GROUP BY
 			1, 2, 3
 	`
@@ -810,393 +787,20 @@ func formatCost(value *big.Rat) string {
 	return value.FloatString(6)
 }
 
-type graphMetric struct {
-	suffix      string
-	title       string
-	yAxis       string
-	prefix      string
-	plotDivisor *big.Rat
-	value       func(row) *big.Rat
-}
-
-func graphMetrics() []graphMetric {
-	return []graphMetric{
-		{
-			suffix:      "token-total",
-			title:       "opencode cumulative token total",
-			yAxis:       "M tokens total",
-			plotDivisor: big.NewRat(1_000_000, 1),
-			value: func(item row) *big.Rat {
-				input := tokenInput(item.usage)
-				output := tokenOutput(item.usage)
-				return input.Add(input, output)
-			},
-		},
-	}
-}
-
 func writePNGs(outPath string, rows []row) error {
-	metrics := graphMetrics()
-	for _, metric := range metrics {
-		path := outPath
-		if len(metrics) > 1 {
-			path = metricOutputPath(outPath, metric.suffix)
-		}
-		file, err := os.Create(path)
-		if err != nil {
-			return fmt.Errorf("create %s png: %w", metric.suffix, err)
-		}
-		err = writeMetricPNG(file, rows, metric)
-		closeErr := file.Close()
-		if err != nil {
-			return err
-		}
-		if closeErr != nil {
-			return fmt.Errorf("close %s png: %w", metric.suffix, closeErr)
-		}
+	file, err := os.Create(outPath)
+	if err != nil {
+		return fmt.Errorf("create token usage png: %w", err)
+	}
+	err = writePNG(file, rows)
+	closeErr := file.Close()
+	if err != nil {
+		return err
+	}
+	if closeErr != nil {
+		return fmt.Errorf("close token usage png: %w", closeErr)
 	}
 	return nil
-}
-
-func metricOutputPath(outPath string, suffix string) string {
-	ext := filepath.Ext(outPath)
-	if ext == "" {
-		ext = ".png"
-	}
-	stem := strings.TrimSuffix(outPath, filepath.Ext(outPath))
-	return stem + "-" + suffix + ext
-}
-
-func writePNG(w io.Writer, rows []row) error {
-	return writeMetricPNG(w, rows, graphMetrics()[0])
-}
-
-func writeMetricPNG(w io.Writer, rows []row, metric graphMetric) error {
-	daily := totalRows(rows)
-	modelKeys := modelKeysForRows(rows)
-	line := charts.NewLine()
-	line.SetGlobalOptions(
-		charts.WithInitializationOpts(opts.Initialization{
-			ChartID:  "token_usage_chart",
-			Width:    "800px",
-			Height:   "480px",
-			Renderer: "svg",
-		}),
-		charts.WithTitleOpts(opts.Title{
-			Title: metric.title,
-			Left:  "24px",
-			Top:   "12px",
-		}),
-		charts.WithLegendOpts(opts.Legend{Show: opts.Bool(false)}),
-		charts.WithColorsOpts(opts.Colors{"#111111", "#444444", "#666666", "#888888", "#aaaaaa", "#c0c0c0"}),
-		charts.WithGridOpts(opts.Grid{Left: "82px", Right: "24px", Top: "96px", Bottom: "64px"}),
-		charts.WithXAxisOpts(opts.XAxis{AxisLabel: &opts.AxisLabel{Rotate: 45}}),
-		charts.WithYAxisOpts(opts.YAxis{SplitLine: &opts.SplitLine{Show: opts.Bool(true)}}),
-		charts.WithTooltipOpts(opts.Tooltip{Show: opts.Bool(true), Trigger: "axis"}),
-	)
-
-	dates := make([]string, 0, len(daily))
-	for _, item := range daily {
-		dates = append(dates, item.date[5:])
-	}
-
-	line.SetXAxis(dates)
-	totalOpts := lineSeriesOpts(0)
-	if marker, ok := todayMarker(daily, metric); ok {
-		totalOpts = append(totalOpts, charts.WithMarkPointNameCoordItemOpts(marker))
-	}
-	line.AddSeries("TOTAL", cumulativeSeries(daily, metric), totalOpts...)
-	for index, key := range modelKeys {
-		seriesRows := modelRows(rows, key)
-		seriesOpts := lineSeriesOpts(index + 1)
-		if marker, ok := todayMarker(seriesRows, metric); ok {
-			seriesOpts = append(seriesOpts, charts.WithMarkPointNameCoordItemOpts(marker))
-		}
-		line.AddSeries(key.provider+"/"+key.model, cumulativeSeries(seriesRows, metric), seriesOpts...)
-	}
-
-	var html bytes.Buffer
-	if err := line.Render(&html); err != nil {
-		return fmt.Errorf("render echarts html: %w", err)
-	}
-	localized, cleanup, err := localizeECharts(html.Bytes())
-	if err != nil {
-		return err
-	}
-	defer cleanup()
-	localized, err = injectChartGraphics(localized, metric.yAxis, todayGraphicLabels(rows, metric), endGraphicLabels(rows, metric))
-	if err != nil {
-		return err
-	}
-	return screenshotChartHTML(w, localized)
-}
-
-func lineSeriesOpts(index int) []charts.SeriesOpts {
-	styles := []struct {
-		lineType string
-		width    float32
-	}{
-		{lineType: "solid", width: 3},
-		{lineType: "dashed", width: 2},
-		{lineType: "dotted", width: 2},
-		{lineType: "solid", width: 1.5},
-		{lineType: "dashed", width: 3},
-		{lineType: "dotted", width: 3},
-	}
-	style := styles[index%len(styles)]
-	return []charts.SeriesOpts{
-		charts.WithLineChartOpts(opts.LineChart{
-			Symbol:       "none",
-			SymbolSize:   0,
-			ShowSymbol:   opts.Bool(false),
-			Smooth:       opts.Bool(true),
-			ConnectNulls: opts.Bool(true),
-		}),
-		charts.WithLineStyleOpts(opts.LineStyle{
-			Type:  style.lineType,
-			Width: style.width,
-		}),
-	}
-}
-
-func todayMarker(rows []row, metric graphMetric) (opts.MarkPointNameCoordItem, bool) {
-	if len(rows) < historyDays {
-		return opts.MarkPointNameCoordItem{}, false
-	}
-	running := new(big.Rat)
-	for i := 0; i < historyDays; i++ {
-		running.Add(running, nonNilRat(metric.value(rows[i])))
-	}
-	plotted := new(big.Rat).Set(running)
-	if metric.plotDivisor != nil && metric.plotDivisor.Sign() != 0 {
-		plotted.Quo(plotted, metric.plotDivisor)
-	}
-	label := formatMetricValue(metric, running)
-	return opts.MarkPointNameCoordItem{
-		Name:       label,
-		Coordinate: []interface{}{rows[historyDays-1].date[5:], ratFloat(plotted)},
-		Value:      label,
-		Symbol:     "circle",
-		SymbolSize: 7,
-		ItemStyle: &opts.ItemStyle{
-			Color:       "#111111",
-			BorderColor: "#111111",
-			BorderWidth: 1,
-		},
-		Label: &opts.Label{
-			Show: opts.Bool(false),
-		},
-	}, true
-}
-
-type todayGraphicLabel struct {
-	Date  string  `json:"date"`
-	Value float64 `json:"value"`
-	Label string  `json:"label"`
-}
-
-type endGraphicLabel struct {
-	Date  string  `json:"date"`
-	Value float64 `json:"value"`
-	Label string  `json:"label"`
-}
-
-func todayGraphicLabels(rows []row, metric graphMetric) []todayGraphicLabel {
-	daily := totalRows(rows)
-	if len(daily) < historyDays {
-		return nil
-	}
-	series := []struct {
-		rows []row
-	}{
-		{rows: daily},
-	}
-	for _, key := range modelKeysForRows(rows) {
-		series = append(series, struct{ rows []row }{rows: modelRows(rows, key)})
-	}
-	labels := make([]todayGraphicLabel, 0, len(series))
-	for _, item := range series {
-		if len(item.rows) < historyDays {
-			continue
-		}
-		running := new(big.Rat)
-		runningIn := new(big.Rat)
-		runningOut := new(big.Rat)
-		for i := 0; i < historyDays; i++ {
-			running.Add(running, nonNilRat(metric.value(item.rows[i])))
-			runningIn.Add(runningIn, tokenInput(item.rows[i].usage))
-			runningOut.Add(runningOut, tokenOutput(item.rows[i].usage))
-		}
-		plotted := new(big.Rat).Set(running)
-		if metric.plotDivisor != nil && metric.plotDivisor.Sign() != 0 {
-			plotted.Quo(plotted, metric.plotDivisor)
-		}
-		labels = append(labels, todayGraphicLabel{
-			Date:  item.rows[historyDays-1].date[5:],
-			Value: ratFloat(plotted),
-			Label: formatTotalTokenLabel(running, runningIn, runningOut),
-		})
-	}
-	return labels
-}
-
-func formatTotalTokenLabel(total *big.Rat, input *big.Rat, output *big.Rat) string {
-	return fmt.Sprintf("%s\n(%s / %s)", formatCommaRat(total), formatCommaRat(input), formatCommaRat(output))
-}
-
-func endGraphicLabels(rows []row, metric graphMetric) []endGraphicLabel {
-	daily := totalRows(rows)
-	if len(daily) == 0 {
-		return nil
-	}
-	series := []struct {
-		label string
-		rows  []row
-	}{
-		{label: "TOTAL", rows: daily},
-	}
-	for _, key := range modelKeysForRows(rows) {
-		series = append(series, struct {
-			label string
-			rows  []row
-		}{label: key.provider + "/" + key.model, rows: modelRows(rows, key)})
-	}
-	labels := make([]endGraphicLabel, 0, len(series))
-	for _, item := range series {
-		if len(item.rows) == 0 {
-			continue
-		}
-		running := new(big.Rat)
-		for _, row := range item.rows {
-			running.Add(running, nonNilRat(metric.value(row)))
-		}
-		plotted := new(big.Rat).Set(running)
-		if metric.plotDivisor != nil && metric.plotDivisor.Sign() != 0 {
-			plotted.Quo(plotted, metric.plotDivisor)
-		}
-		last := item.rows[len(item.rows)-1]
-		labels = append(labels, endGraphicLabel{
-			Date:  last.date[5:],
-			Value: ratFloat(plotted),
-			Label: item.label,
-		})
-	}
-	return labels
-}
-
-func injectChartGraphics(html []byte, yAxisLabel string, todayLabels []todayGraphicLabel, endLabels []endGraphicLabel) ([]byte, error) {
-	todayData, err := json.Marshal(todayLabels)
-	if err != nil {
-		return nil, fmt.Errorf("marshal today labels: %w", err)
-	}
-	endData, err := json.Marshal(endLabels)
-	if err != nil {
-		return nil, fmt.Errorf("marshal end labels: %w", err)
-	}
-	axisLabel, err := json.Marshal(yAxisLabel)
-	if err != nil {
-		return nil, fmt.Errorf("marshal y-axis label: %w", err)
-	}
-	script := fmt.Sprintf(`<script type="text/javascript">
-setTimeout(function() {
-  const chart = goecharts_token_usage_chart;
-  const yAxisLabel = %s;
-  const todayLabels = %s;
-  const endLabels = %s;
-  const yAxisLabelWidth = Math.max(72, yAxisLabel.length * 6.6);
-  const yAxisLabelLeft = Math.max(8, 82 - yAxisLabelWidth / 2);
-  const graphics = [{
-    type: 'text',
-    left: yAxisLabelLeft,
-    top: 72,
-    zlevel: 10,
-    z: 100,
-    silent: true,
-    style: {text: yAxisLabel, fill: '#555555', font: '12px Arial, sans-serif', textAlign: 'left', textVerticalAlign: 'middle'}
-  }].concat(todayLabels.map(function(item) {
-    const point = chart.convertToPixel({xAxisIndex: 0, yAxisIndex: 0}, [item.date, item.value]);
-    const lines = item.label.split('\n');
-    const width = Math.max(58, Math.max.apply(null, lines.map(function(line) { return line.length; })) * 7.4 + 12);
-    const x = Math.max(82, point[0] - width - 12);
-    const y = Math.max(96, Math.min(390, point[1] - 34));
-	    return {
-	      type: 'group',
-	      left: x,
-	      top: y,
-	      zlevel: 10,
-      z: 100,
-      silent: true,
-      children: [
-		{type: 'text', style: {x: width - 6, y: 16, text: item.label, fill: '#111111', font: 'bold 12px Arial, sans-serif', textAlign: 'right', textVerticalAlign: 'middle', lineHeight: 14, textBorderColor: '#ffffff', textBorderWidth: 4}}
-      ]
-    };
-  })).concat(endLabels.map(function(item) {
-    const point = chart.convertToPixel({xAxisIndex: 0, yAxisIndex: 0}, [item.date, item.value]);
-    return {
-      type: 'text',
-      left: Math.max(92, point[0] - 126),
-      top: Math.max(96, Math.min(404, point[1] - 8)),
-      zlevel: 10,
-      z: 100,
-      silent: true,
-      style: {x: 120, y: 8, text: item.label, fill: '#111111', font: '12px Arial, sans-serif', textAlign: 'right', textVerticalAlign: 'middle', textBorderColor: '#ffffff', textBorderWidth: 4}
-    };
-  }));
-  chart.setOption({graphic: graphics});
-}, 0);
-</script>`, string(axisLabel), string(todayData), string(endData))
-	text := string(html)
-	marker := "</body>"
-	if strings.Contains(text, marker) {
-		return []byte(strings.Replace(text, marker, script+marker, 1)), nil
-	}
-	return append(html, []byte(script)...), nil
-}
-
-func cumulativeSeries(rows []row, metric graphMetric) []opts.LineData {
-	series := make([]opts.LineData, 0, len(rows))
-	running := new(big.Rat)
-	for _, item := range rows {
-		running.Add(running, nonNilRat(metric.value(item)))
-		plotted := new(big.Rat).Set(running)
-		if metric.plotDivisor != nil && metric.plotDivisor.Sign() != 0 {
-			plotted.Quo(plotted, metric.plotDivisor)
-		}
-		series = append(series, opts.LineData{Value: ratFloat(plotted)})
-	}
-	return series
-}
-
-func modelKeysForRows(rows []row) []usageKey {
-	seen := make(map[usageKey]struct{})
-	for _, item := range rows {
-		if item.provider == "TOTAL" && item.model == "TOTAL" {
-			continue
-		}
-		seen[usageKey{provider: item.provider, model: item.model}] = struct{}{}
-	}
-	result := make([]usageKey, 0, len(seen))
-	for key := range seen {
-		result = append(result, key)
-	}
-	sort.Slice(result, func(i, j int) bool {
-		if result[i].provider != result[j].provider {
-			return result[i].provider < result[j].provider
-		}
-		return result[i].model < result[j].model
-	})
-	return result
-}
-
-func modelRows(rows []row, key usageKey) []row {
-	result := make([]row, 0, historyDays+projectionDays)
-	for _, item := range rows {
-		if item.provider == key.provider && item.model == key.model {
-			result = append(result, item)
-		}
-	}
-	sort.Slice(result, func(i, j int) bool { return result[i].date < result[j].date })
-	return result
 }
 
 func localizeECharts(html []byte) ([]byte, func(), error) {
@@ -1284,15 +888,20 @@ func screenshotChartHTMLImage(html []byte) (*image.Gray, error) {
 
 	var pngBytes []byte
 	var echartsType string
+	var chartReady bool
 	pageURL := (&url.URL{Scheme: "file", Path: filepath.ToSlash(abs)}).String()
 	if err := chromedp.Run(ctx,
 		chromedp.EmulateViewport(820, 500),
 		chromedp.Navigate(pageURL),
 		chromedp.WaitVisible(`#token_usage_chart`, chromedp.ByQuery),
 		chromedp.Evaluate(`typeof echarts`, &echartsType),
+		chromedp.Evaluate(`window.trmnlChartReady === true`, &chartReady),
 		chromedp.ActionFunc(func(context.Context) error {
 			if echartsType != "object" {
 				return fmt.Errorf("echarts unavailable in browser: typeof echarts is %q", echartsType)
+			}
+			if !chartReady {
+				return fmt.Errorf("token usage dashboard failed to initialize")
 			}
 			return nil
 		}),
@@ -1552,20 +1161,6 @@ func sumCost(rows []row, start int, end int) *big.Rat {
 		total.Add(total, nonNilRat(item.outCost))
 	}
 	return total
-}
-
-func formatCompactRat(value *big.Rat) string {
-	if value == nil {
-		return "0.00"
-	}
-	return value.FloatString(2)
-}
-
-func formatMetricValue(metric graphMetric, value *big.Rat) string {
-	if metric.prefix == "$" {
-		return metric.prefix + formatCompactRat(value)
-	}
-	return formatCommaRat(value)
 }
 
 func formatCommaRat(value *big.Rat) string {

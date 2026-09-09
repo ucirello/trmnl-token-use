@@ -48,6 +48,49 @@ func TestLoadUsage(t *testing.T) {
 	assertUsage(t, usage[dailyUsageKey{date: "2026-01-11", provider: "openai", model: "gpt-5.1"}], usageFromInts(100, 400, 500, 300, 200))
 }
 
+func TestLoadUsageSchemas(t *testing.T) {
+	for _, schema := range []string{"legacy", "session", "both", "neither"} {
+		t.Run(schema, func(t *testing.T) {
+			db, err := sql.Open("sqlite", ":memory:")
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer db.Close()
+			var queries []string
+			if schema == "legacy" || schema == "both" {
+				queries = append(queries,
+					`CREATE TABLE message (id text PRIMARY KEY, time_created integer, data text)`,
+					fmt.Sprintf(`INSERT INTO message VALUES ('same-id', %d, '{"role":"assistant","providerID":"openai","modelID":"test","tokens":{"input":10}}')`, testMillis(2026, 1, 10)))
+			}
+			if schema == "session" || schema == "both" {
+				queries = append(queries,
+					`CREATE TABLE session_message (id text PRIMARY KEY, type text, time_created integer, data text)`,
+					fmt.Sprintf(`INSERT INTO session_message VALUES ('same-id', 'assistant', %d, '{"model":{"providerID":"openai","id":"test"},"tokens":{"input":20}}')`, testMillis(2026, 1, 10)))
+			}
+			for _, query := range queries {
+				if _, err := db.Exec(query); err != nil {
+					t.Fatal(err)
+				}
+			}
+			usage, err := loadUsage(context.Background(), db, testDate(2026, 1, 1))
+			if schema == "neither" {
+				if err == nil || !strings.Contains(err.Error(), "supported message table") {
+					t.Fatalf("want unsupported schema error, got %v", err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			want := int64(20)
+			if schema == "legacy" {
+				want = 10
+			}
+			assertUsage(t, usage[dailyUsageKey{date: "2026-01-10", provider: "openai", model: "test"}], usageFromInts(want, 0, 0, 0, 0))
+		})
+	}
+}
+
 func TestDecodePricing(t *testing.T) {
 	prices, err := decodePricing(strings.NewReader(`{
 		"anthropic": {
@@ -72,28 +115,6 @@ func TestDecodePricing(t *testing.T) {
 	})
 	if _, ok := prices[usageKey{provider: "anthropic", model: "free-model"}]; ok {
 		t.Fatal("unexpected pricing for model without cost")
-	}
-}
-
-func TestParseOpenCodeDataDir(t *testing.T) {
-	got, err := parseOpenCodeDataDir(strings.Join([]string{
-		"home       /Users/test",
-		"data       /Users/test/Library/Application Support/opencode",
-		"cache      /Users/test/.cache/opencode",
-	}, "\n"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	want := "/Users/test/Library/Application Support/opencode"
-	if got != want {
-		t.Fatalf("data path mismatch: got %q, want %q", got, want)
-	}
-}
-
-func TestParseOpenCodeDataDirMissingData(t *testing.T) {
-	_, err := parseOpenCodeDataDir("home /Users/test\n")
-	if err == nil {
-		t.Fatal("expected error")
 	}
 }
 
@@ -173,16 +194,12 @@ func TestBuildRowsProjection(t *testing.T) {
 
 func TestWritePNG(t *testing.T) {
 	var out bytes.Buffer
-	err := writePNG(&out, []row{
-		{
-			date:     "2026-01-01",
-			provider: "TOTAL",
-			model:    "TOTAL",
-			usage:    usageFromInts(1_000_000, 2_000_000, 3_000_000, 4_000_000, 5_000_000),
-			inCost:   rat("24.75"),
-			outCost:  rat("225"),
-		},
-	})
+	window := reportWindow{start: testDate(2026, 1, 1), today: testDate(2026, 1, 30)}
+	usage := make(map[dailyUsageKey]usageTotals)
+	for model, tokens := range map[string]int64{"first": 500, "second": 300, "third": 150, "fourth": 50} {
+		usage[dailyUsageKey{date: "2026-01-30", provider: "test", model: model}] = usageFromInts(tokens, 0, 0, 0, 0)
+	}
+	err := writePNG(&out, buildRows(usage, nil, window))
 	if err != nil {
 		t.Fatal(err)
 	}
